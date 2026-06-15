@@ -55,6 +55,8 @@
 
 .PARAMETER LogPath
     Full path to the log file. A timestamped log under .\Logs is used by default.
+    If -WhatIf is used and -LogPath is not explicitly provided, the log file name is
+    prefixed with WhatIf_.
 
 .PARAMETER SkipSqlDatabaseSyncCheck
     Skips SQL DMV database sync validation and only validates cluster SQL HA resource
@@ -131,6 +133,14 @@ $ErrorActionPreference = 'Stop'
 # honor -WhatIf/-Confirm through the script-level CmdletBinding.
 $script:CommandRuntime = $PSCmdlet
 $script:LogPath = $LogPath
+
+# Make dry-run logs easy to distinguish from real maintenance logs. If the operator
+# provides -LogPath explicitly, respect that exact path.
+if ($WhatIfPreference -and -not $PSBoundParameters.ContainsKey('LogPath')) {
+    $logDirectory = Split-Path -Parent $script:LogPath
+    $logFileName = Split-Path -Leaf $script:LogPath
+    $script:LogPath = Join-Path $logDirectory ("WhatIf_{0}" -f $logFileName)
+}
 
 function Initialize-Log {
     # Create the log directory on demand. The log file captures the same progress
