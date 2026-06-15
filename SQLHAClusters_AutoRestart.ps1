@@ -134,15 +134,16 @@ $script:LogPath = $LogPath
 
 function Initialize-Log {
     # Create the log directory on demand. The log file captures the same progress
-    # messages shown in the console.
+    # messages shown in the console. Logging is allowed during -WhatIf so dry runs
+    # remain readable and still leave an audit trail.
     $logDirectory = Split-Path -Parent $script:LogPath
 
     if ($logDirectory -and -not (Test-Path -LiteralPath $logDirectory)) {
-        New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+        New-Item -Path $logDirectory -ItemType Directory -Force -WhatIf:$false | Out-Null
     }
 
     "Log started: {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |
-        Set-Content -LiteralPath $script:LogPath
+        Set-Content -LiteralPath $script:LogPath -WhatIf:$false
 }
 
 function Write-Log {
@@ -156,7 +157,7 @@ function Write-Log {
     )
 
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    Add-Content -LiteralPath $script:LogPath -Value $line
+    Add-Content -LiteralPath $script:LogPath -Value $line -WhatIf:$false
     Write-Host $line
 }
 
