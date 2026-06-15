@@ -1,0 +1,2 @@
+# Ignore local example and scratch files in the examples folder.
+examples/*
