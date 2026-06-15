@@ -32,6 +32,10 @@
     such as Move-ClusterGroup, Suspend-ClusterNode, Restart-Computer, Resume-ClusterNode,
     and service starts/stops are skipped during -WhatIf.
 
+    When multiple clusters are supplied, this window processes the first cluster and a
+    separate PowerShell window is opened for each additional cluster. That keeps each
+    cluster's restart output and log context isolated.
+
 .PARAMETER ClusterName
     One or more clusters to process. This parameter is mandatory so the operator must
     explicitly provide the cluster group for each run.
@@ -63,19 +67,24 @@
     health. This is useful when SQL connectivity is unavailable from the operator host,
     but it provides a weaker AG health signal.
 
-.EXAMPLE
-    .\SQLHAClusters_AutoRestart.ps1 -ClusterName '<ClusterName1>', '<ClusterName2>' -WhatIf
-
-    Dry-run the workflow for the supplied clusters. This shows the steps and planned
-    disruptive actions without moving roles, restarting servers, or changing services.
+.PARAMETER NoClusterWindowFanOut
+    Internal switch used by child windows so they process only their assigned cluster
+    instead of opening more windows.
 
 .EXAMPLE
-    .\SQLHAClusters_AutoRestart.ps1 -ClusterName '<ClusterName>'
+    $clusters = @('ClusterName1', 'ClusterName2')
+    .\SQLHAClusters_AutoRestart.ps1 -ClusterName $clusters -WhatIf
+
+    Dry-run the workflow for the supplied clusters. The first cluster stays in the
+    current window and the second cluster opens in a separate PowerShell window.
+
+.EXAMPLE
+    .\SQLHAClusters_AutoRestart.ps1 -ClusterName 'ClusterName'
 
     Run the workflow against one supplied cluster.
 
 .EXAMPLE
-    .\SQLHAClusters_AutoRestart.ps1 -ClusterName '<ClusterName>' -SkipSqlDatabaseSyncCheck
+    .\SQLHAClusters_AutoRestart.ps1 -ClusterName 'ClusterName' -SkipSqlDatabaseSyncCheck
 
     Run one cluster while checking only cluster SQL HA resource state, similar to the
     AG_state_check.ps1 style of validation.
@@ -122,7 +131,11 @@ param(
 
     # Use this when the operator workstation can query cluster state but cannot connect to SQL.
     [Parameter()]
-    [switch] $SkipSqlDatabaseSyncCheck
+    [switch] $SkipSqlDatabaseSyncCheck,
+
+    # Child processes use this to prevent recursive window spawning.
+    [Parameter()]
+    [switch] $NoClusterWindowFanOut
 )
 
 # Stop on unhandled errors so a failed HA check or failed reboot does not silently
@@ -134,12 +147,18 @@ $ErrorActionPreference = 'Stop'
 $script:CommandRuntime = $PSCmdlet
 $script:LogPath = $LogPath
 
-# Make dry-run logs easy to distinguish from real maintenance logs. If the operator
-# provides -LogPath explicitly, respect that exact path.
-if ($WhatIfPreference -and -not $PSBoundParameters.ContainsKey('LogPath')) {
-    $logDirectory = Split-Path -Parent $script:LogPath
-    $logFileName = Split-Path -Leaf $script:LogPath
-    $script:LogPath = Join-Path $logDirectory ("WhatIf_{0}" -f $logFileName)
+# Make each default log name cluster-specific. This matters when multiple windows run
+# at the same time. If the operator provides -LogPath explicitly, respect that exact path.
+if (-not $PSBoundParameters.ContainsKey('LogPath')) {
+    $firstClusterForLog = [string] $ClusterName[0]
+    $safeClusterForLog = $firstClusterForLog -replace '[\\/:*?"<>|]', '_'
+
+    if ([string]::IsNullOrWhiteSpace($safeClusterForLog)) {
+        $safeClusterForLog = 'Cluster'
+    }
+
+    $whatIfPrefix = if ($WhatIfPreference) { 'WhatIf_' } else { '' }
+    $script:LogPath = Join-Path $PSScriptRoot ("Logs\{0}SQLHAClusters_AutoRestart_{1}_{2}.log" -f $whatIfPrefix, $safeClusterForLog, (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
 function Initialize-Log {
@@ -169,6 +188,116 @@ function Write-Log {
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Add-Content -LiteralPath $script:LogPath -Value $line -WhatIf:$false
     Write-Host $line
+}
+
+function ConvertTo-ProcessArgument {
+    # Start-Process receives one argument string. Quote anything that may contain spaces
+    # so script paths, log paths, and cluster names survive the child process launch.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Argument
+    )
+
+    if ($Argument -match '[\s"]') {
+        return '"' + ($Argument -replace '"', '\"') + '"'
+    }
+
+    return $Argument
+}
+
+function Get-PowerShellProcessPath {
+    # Prefer the current PowerShell executable so Windows PowerShell launches Windows
+    # PowerShell children and PowerShell 7 launches PowerShell 7 children.
+    try {
+        $currentProcessPath = (Get-Process -Id $PID -ErrorAction Stop).Path
+
+        if (-not [string]::IsNullOrWhiteSpace($currentProcessPath)) {
+            return $currentProcessPath
+        }
+    }
+    catch {
+        # Fall back below.
+    }
+
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        return 'pwsh.exe'
+    }
+
+    return 'powershell.exe'
+}
+
+function New-ClusterLogPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ClusterName
+    )
+
+    $safeClusterName = $ClusterName -replace '[\\/:*?"<>|]', '_'
+
+    if ([string]::IsNullOrWhiteSpace($safeClusterName)) {
+        $safeClusterName = 'Cluster'
+    }
+
+    $whatIfPrefix = if ($WhatIfPreference) { 'WhatIf_' } else { '' }
+    return (Join-Path $PSScriptRoot ("Logs\{0}SQLHAClusters_AutoRestart_{1}_{2}.log" -f $whatIfPrefix, $safeClusterName, (Get-Date -Format 'yyyyMMdd_HHmmss')))
+}
+
+function Start-AdditionalClusterWindows {
+    # Keep the first cluster in this window. Every additional cluster gets a new
+    # PowerShell window with -NoClusterWindowFanOut so child windows do not fan out again.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $ClusterNames
+    )
+
+    if ($NoClusterWindowFanOut -or $ClusterNames.Count -le 1) {
+        return @($ClusterNames)
+    }
+
+    $firstCluster = [string] $ClusterNames[0]
+    $additionalClusters = @($ClusterNames | Select-Object -Skip 1)
+    $powerShellPath = Get-PowerShellProcessPath
+
+    foreach ($cluster in $additionalClusters) {
+        $childLogPath = New-ClusterLogPath -ClusterName ([string] $cluster)
+        $arguments = @(
+            '-NoExit',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            (ConvertTo-ProcessArgument -Argument $PSCommandPath),
+            '-ClusterName',
+            (ConvertTo-ProcessArgument -Argument ([string] $cluster)),
+            '-StableOnlineSeconds',
+            [string] $StableOnlineSeconds,
+            '-CheckIntervalSeconds',
+            [string] $CheckIntervalSeconds,
+            '-NodeOnlineTimeoutSeconds',
+            [string] $NodeOnlineTimeoutSeconds,
+            '-ClusterHealthTimeoutSeconds',
+            [string] $ClusterHealthTimeoutSeconds,
+            '-SqlQueryTimeoutSeconds',
+            [string] $SqlQueryTimeoutSeconds,
+            '-LogPath',
+            (ConvertTo-ProcessArgument -Argument $childLogPath),
+            '-NoClusterWindowFanOut'
+        )
+
+        if ($SkipSqlDatabaseSyncCheck) {
+            $arguments += '-SkipSqlDatabaseSyncCheck'
+        }
+
+        if ($WhatIfPreference) {
+            $arguments += '-WhatIf'
+        }
+
+        Write-Log -Message ("Opening separate PowerShell window for cluster {0}. Log: {1}" -f $cluster, $childLogPath)
+        Start-Process -FilePath $powerShellPath -ArgumentList ($arguments -join ' ') -WindowStyle Normal -WhatIf:$false | Out-Null
+    }
+
+    Write-Log -Message ("This window will continue with first cluster only: {0}" -f $firstCluster)
+    return @($firstCluster)
 }
 
 function Write-NodeStep {
@@ -1027,6 +1156,9 @@ function Invoke-ClusterRestartWorkflow {
 
 # Entry point. Everything above this line defines helpers; actual work starts here.
 Initialize-Log
+
+$ClusterName = @(Start-AdditionalClusterWindows -ClusterNames $ClusterName)
+
 Import-Module FailoverClusters -ErrorAction Stop
 
 Write-Log -Message ("SQL HA automated restart started. Clusters: {0}" -f ($ClusterName -join ', '))
