@@ -293,7 +293,7 @@ function Start-AdditionalClusterWindows {
         }
 
         Write-Log -Message ("Opening separate PowerShell window for cluster {0}. Log: {1}" -f $cluster, $childLogPath)
-        Start-Process -FilePath $powerShellPath -ArgumentList ($arguments -join ' ') -WindowStyle Normal -WhatIf:$false | Out-Null
+        Start-Process -FilePath $powerShellPath -ArgumentList ($arguments -join ' ') -WindowStyle Normal | Out-Null
     }
 
     Write-Log -Message ("This window will continue with first cluster only: {0}" -f $firstCluster)
